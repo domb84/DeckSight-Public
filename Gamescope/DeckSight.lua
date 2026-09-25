@@ -30,10 +30,9 @@ local deckSight_modegen = function(base_mode, refresh)
     -- Set fixed resolution for DeckSight OLED (rotated)
     gamescope.modegen.set_resolution(mode, 1080, 1920)
 
-    -- Set porch timings based on actual EDID values (mode, FP, Sync, BP)
-    -- vsync increase seems to improve init sync
+    -- Keep the generated mode aligned with the EDID's preferred 60 Hz timing.
     gamescope.modegen.set_h_timings(mode, 48, 32, 80)
-    gamescope.modegen.set_v_timings(mode, 3, 14, 61)
+    gamescope.modegen.set_v_timings(mode, 3, 10, 42)
 
     -- Recalculate pixel clock and vrefresh based on new timing and refresh
     mode.clock = gamescope.modegen.calc_max_clock(mode, refresh)
@@ -48,7 +47,7 @@ gamescope.config.known_displays.decksight = {
     dynamic_refresh_rates = deckSight_refresh_rates,
     dynamic_modegen = deckSight_modegen,
 
-    colorimetry = decksight_oled_colorimetry_measured, --select measured or spec
+    colorimetry = decksight_oled_colorimetry_spec,
 
     hdr = {
         supported = true,
