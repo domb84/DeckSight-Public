@@ -153,6 +153,25 @@ def make_mode(hz):
     return m
 
 
+def transition_rates(current, target, rates, max_step):
+    """Return supported rates from current to target in bounded increments."""
+    if current is None or max_step is None:
+        return [target]
+
+    path = []
+    cursor = current
+    while cursor != target:
+        if target > cursor:
+            candidates = [rate for rate in rates if cursor < rate <= min(target, cursor + max_step)]
+            next_rate = max(candidates)
+        else:
+            candidates = [rate for rate in rates if max(target, cursor - max_step) <= rate < cursor]
+            next_rate = min(candidates)
+        path.append(next_rate)
+        cursor = next_rate
+    return path
+
+
 def find_edp(fd):
     res = drm.drmModeGetResources(fd)
     if not res:
@@ -367,13 +386,25 @@ def active_vt():
 
 
 def main():
+    global H_FP, H_SYNC, H_BP, V_FP, V_SYNC, V_BP
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-n", type=int, default=30, help="modesets")
     ap.add_argument("--lua", default=default_lua(),
                     help="gamescope script to take timings and rates from (default: installed one)")
+    ap.add_argument("--h-timings", type=int, nargs=3, metavar=("FP", "SYNC", "BP"),
+                    help="override horizontal front porch, sync, and back porch")
+    ap.add_argument("--v-timings", type=int, nargs=3, metavar=("FP", "SYNC", "BP"),
+                    help="override vertical front porch, sync, and back porch")
     ap.add_argument("--rates", type=int, nargs="+",
                     help="subset of refresh rates (default: every rate the script offers)")
     ap.add_argument("--settle", type=float, default=1.5, help="seconds after modeset before snapshot")
+    ap.add_argument("--max-rate-step", type=int,
+                    help="ramp to each target in supported steps no larger than this many Hz")
+    ap.add_argument("--step-settle", type=float, default=1.0,
+                    help="seconds to wait after each intermediate ramp step (default: 1.0)")
+    ap.add_argument("--seed", type=int,
+                    help="random seed for reproducible target-rate sequences")
     ap.add_argument("--vt", type=int, default=5,
                     help="spare VT to switch to (must be one fbcon draws on: 4-6 on SteamOS)")
     ap.add_argument("--label-timeout", type=float, default=120, help="seconds to wait for a label")
@@ -383,7 +414,20 @@ def main():
     a = ap.parse_args()
 
     lua_rates = load_lua(a.lua)
+    if a.h_timings is not None:
+        H_FP, H_SYNC, H_BP = a.h_timings
+    if a.v_timings is not None:
+        V_FP, V_SYNC, V_BP = a.v_timings
     a.rates = a.rates or lua_rates
+    a.rates = sorted(set(a.rates))
+    if any(value < 1 for value in (H_FP, H_SYNC, H_BP, V_FP, V_SYNC, V_BP)):
+        ap.error("timing values must be at least 1")
+    if a.max_rate_step is not None and a.max_rate_step < 1:
+        ap.error("--max-rate-step must be at least 1")
+    if a.step_settle < 0:
+        ap.error("--step-settle must not be negative")
+    if a.seed is not None:
+        random.seed(a.seed)
     reexec = os.environ.get("DECKSIGHT_INHIBITED")  # second pass under systemd-inhibit
     if not reexec:
         print(f"timings from {a.lua}: H {H_FP}/{H_SYNC}/{H_BP}  V {V_FP}/{V_SYNC}/{V_BP}; "
@@ -446,36 +490,49 @@ def main():
         current = previous = None
         for i in range(1, a.n + 1):
             hz = random.choice([r for r in a.rates if r != current] or a.rates)
-            mode = make_mode(hz)
             before = repro.snapshot(dev)
             t0 = time.time()
-            rc = drm.drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0, ctypes.byref(conn), 1, ctypes.byref(mode))
-            if rc:
-                msg = f"[{i}/{a.n}] {hz} Hz rejected by the kernel: {os.strerror(ctypes.get_errno())}"
-                print(msg)
-                console.write(msg + "\n")
+            transition = transition_rates(current, hz, a.rates, a.max_rate_step)
+            for rate_index, rate in enumerate(transition):
+                mode = make_mode(rate)
+                rc = drm.drmModeSetCrtc(
+                    fd, crtc_id, fb.fb_id, 0, 0, ctypes.byref(conn), 1, ctypes.byref(mode)
+                )
+                if rc:
+                    msg = f"[{i}/{a.n}] {rate} Hz rejected by the kernel: {os.strerror(ctypes.get_errno())}"
+                    print(msg)
+                    console.write(msg + "\n")
+                    break
+                if rate_index < len(transition) - 1:
+                    time.sleep(a.step_settle)
+            else:
+                mode = make_mode(hz)
+                previous, current = current, hz
+                time.sleep(a.settle)
+                after = repro.snapshot(dev)
+                kmsgs = klog.new()
+                status = f"[{i}/{a.n}] {hz} Hz ({mode.clock / 1000:.2f} MHz)  " \
+                         f"{repro.brief(after['decoded'])}"
+                if len(transition) > 1:
+                    status += "  via " + "->".join(map(str, transition)) + " Hz"
+                print(status)
+                console.write(status + "\n   label? ")
+                label = wait_label(inputs, a.label_timeout, a.vt, console)
+                console.write(f"{label or 'quit'}\n")
+                if label is None:
+                    break
+                counts[label] = counts.get(label, 0) + 1
+                log.write(json.dumps({"time": t0, "kind": "trigger", "trigger": "drm-refresh", "iteration": i,
+                                      "requested_hz": hz, "previous_hz": previous, "clock_khz": mode.clock, "label": label,
+                                      "transition_hz": transition, "step_settle_seconds": a.step_settle,
+                                      "random_seed": a.seed,
+                                      "timings": {"h": [H_FP, H_SYNC, H_BP], "v": [V_FP, V_SYNC, V_BP],
+                                                  "lua": a.lua},
+                                      "before": before, "after": after, "kernel": kmsgs}) + "\n")
+                log.flush()
+                if label not in ("ok", "timeout") and a.stop_on_bad:
+                    break
                 continue
-            previous, current = current, hz
-            time.sleep(a.settle)
-            after = repro.snapshot(dev)
-            kmsgs = klog.new()
-            status = f"[{i}/{a.n}] {hz} Hz ({mode.clock / 1000:.2f} MHz)  " \
-                     f"{repro.brief(after['decoded'])}"
-            print(status)
-            console.write(status + "\n   label? ")
-            label = wait_label(inputs, a.label_timeout, a.vt, console)
-            console.write(f"{label or 'quit'}\n")
-            if label is None:
-                break
-            counts[label] = counts.get(label, 0) + 1
-            log.write(json.dumps({"time": t0, "kind": "trigger", "trigger": "drm-refresh", "iteration": i,
-                                  "requested_hz": hz, "previous_hz": previous, "clock_khz": mode.clock, "label": label,
-                                  "timings": {"h": [H_FP, H_SYNC, H_BP], "v": [V_FP, V_SYNC, V_BP],
-                                              "lua": a.lua},
-                                  "before": before, "after": after, "kernel": kmsgs}) + "\n")
-            log.flush()
-            if label not in ("ok", "timeout") and a.stop_on_bad:
-                break
     except VTChanged:
         vt_changed = True
         print("console switched away (e.g. Ctrl+Alt+F1): stopping")

@@ -129,12 +129,35 @@ firmware resume sequence performs additional ANX initialization.
 it as a general register dump returned zero/status-buffer artifacts, so it
 should not be treated as a reliable ANX register inspection API.
 
+The captured live DSDT decompiles `RDDI (Arg0)` as follows:
+
+```text
+ANW4(0x0C, 0x6C, 0x00000137)
+ANW4(0x0C, 0x6C, (Arg0 << 8) | 0x06)
+Sleep(20 ms)
+ANR4(0xC0, 0x70)
+```
+
+The packet construction is a standard one-byte DCS read sequence, but the
+header writes use slave `0x0C` while the receive FIFO is read from `0xC0`.
+`chicago_registers.h` identifies `0xC0` as MIPI port 0, so `RDDI` cannot
+produce a meaningful response as written. It also confirms that the firmware
+does not modify `VID_MODE_CFG` for this operation; experimental probes must
+preserve the native `0x00003f01` value.
+
 ## Current Conclusion
 
 The most promising fix surface is the EC/ANX firmware payload, not Lua, EDID,
 KWin, or ordinary DRM modesetting. A complete recovery sequence would need to
 replay the ANX MIPI/DPCD/OCM/panel initialization that firmware performs during
 `s3_turn_on_eDP`.
+
+However, a boot-only delay cannot by itself fix corruption that a later DRM
+refresh-rate modeset can reproduce. Either the ANX bridge autonomously repeats
+the vulnerable downstream transition when its eDP input retrains, or persistent
+configuration programmed by firmware makes that runtime transition marginal.
+The next analysis must distinguish those possibilities before treating an EC
+boot/resume timing change as a prevention fix.
 
 The DeckHD `patcher.cpp` is the strongest public reference for the required
 patching model. It may provide the register structures and command-table format
@@ -156,21 +179,25 @@ Desktop. The documented workaround is a quick sleep/wake using the power button;
 a full shutdown is not required.
 
 The ACPI investigation above is consistent with this workaround: an actual
-suspend/resume restores the panel, while manually calling `DPCY()`, `_WAK(3)`,
-and re-enabling eDP does not. The real resume path runs additional firmware
-initialization. A software-triggered DPMS off/on is worth comparing, but should
-not be assumed to perform the same EC/ANX sequence as suspend/resume.
+suspend/resume sometimes restores the panel, while another identical run can
+leave full random noise. Manually calling `DPCY()`, `_WAK(3)`, and re-enabling
+eDP does not restore it. The real resume path runs additional firmware
+initialization, but its result is intermittent. A software-triggered DPMS
+off/on is worth comparing, but should not be assumed to perform the same
+EC/ANX sequence as suspend/resume.
 
 ### Software Variables to Test
 
 **Refresh rate and timings.** [DeckSight.lua](Gamescope/DeckSight.lua) generates
 1080x1920 modes from 40 to 80 Hz with custom porch timings. It notes that some
 refresh rates had less stable initialization and that a longer vertical sync may
-improve synchronization. A fixed 60 Hz test can show whether dynamic modesets
-contribute. [drm_modecycle.py](tools/display/drm_modecycle.py) exercises custom
-timings with color bars and captures link state. It holds DRM master and blocks
-suspend because suspending while it owns DRM master hung the Deck during testing;
-do not combine its run with suspend tests.
+improve synchronization. [drm_modecycle.py](tools/display/drm_modecycle.py)
+exercises custom timings with color bars and captures link state. A seeded A/B
+test showed that the fault occurs even when every transition is limited to 1 Hz
+and followed by a one-second intermediate dwell; simple rate ramping is not a
+prevention fix. The tool holds DRM master and blocks suspend because suspending
+while it owns DRM master hung the Deck during testing; do not combine its run
+with suspend tests.
 
 **HDR and colorimetry.** The Gamescope display entry currently sets
 `hdr.force_enabled = true` and uses measured colorimetry; specification values
