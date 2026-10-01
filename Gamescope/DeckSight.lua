@@ -14,14 +14,14 @@ local decksight_oled_colorimetry_measured = {
     w = { x = 0.3117, y = 0.3197 }
 }
 
--- Static Dynamic Refresh Range (40-60Hz)
--- Capped at 60Hz: rates above 60 have less stable inits and can cause the
--- panel to lose sync or drop a colour on refresh changes (higher pixel clock
--- = less link margin). Sleep/wake recovers it; capping avoids the worst modes.
+-- Static Dynamic Refresh Range (40-80Hz)
+-- Omitted RRs with less stable inits
 local deckSight_refresh_rates = {
     40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
     50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
-    60
+    60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+    70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+    80
 }
 
 local deckSight_modegen = function(base_mode, refresh)
@@ -30,9 +30,10 @@ local deckSight_modegen = function(base_mode, refresh)
     -- Set fixed resolution for DeckSight OLED (rotated)
     gamescope.modegen.set_resolution(mode, 1080, 1920)
 
-    -- Keep the generated mode aligned with the EDID's preferred 60 Hz timing.
+    -- Set porch timings based on actual EDID values (mode, FP, Sync, BP)
+    -- vsync increase seems to improve init sync
     gamescope.modegen.set_h_timings(mode, 48, 32, 80)
-    gamescope.modegen.set_v_timings(mode, 3, 10, 42)
+    gamescope.modegen.set_v_timings(mode, 3, 14, 61)
 
     -- Recalculate pixel clock and vrefresh based on new timing and refresh
     mode.clock = gamescope.modegen.calc_max_clock(mode, refresh)
@@ -47,7 +48,7 @@ gamescope.config.known_displays.decksight = {
     dynamic_refresh_rates = deckSight_refresh_rates,
     dynamic_modegen = deckSight_modegen,
 
-    colorimetry = decksight_oled_colorimetry_spec,
+    colorimetry = decksight_oled_colorimetry_measured, --select measured or spec
 
     hdr = {
         supported = true,
