@@ -291,6 +291,49 @@ of a clean colour rotation, consistent with documented escalation from cast
 to static. This is a coherent explanatory model, not a confirmed mechanism;
 the bridge's internal FIFO/alignment state is not observable from the OS.
 
+**Correction: a whole-stream rotation does not produce the observed colours.**
+Shifting the entire RGB888 stream by one byte maps each primary to a different
+primary: red reads as (B, R, G) = green, green as blue, blue as red. The
+observed result is additive: red becomes yellow (R+G), green becomes cyan
+(G+B), and blue becomes magenta (B+R). So only a *fraction* of bytes are
+displaced by one channel position, with the rest correct.
+
+The firmware configures 4 DSI lanes (`SW_PANEL_INFO_0 = 0x0c`, lane-count
+field 3). That makes a per-lane byte slip a precise fit:
+
+- Bytes are distributed round-robin, so one lane arriving a byte-clock late
+  carries the byte from 4 positions earlier.
+- Since 4 ≡ 1 (mod 3), each displaced byte lands one channel late (G slot
+  carries R, B carries G, R carries B). That is exactly R→R+G, G→G+B, B→B+R,
+  with white and grey unchanged.
+- With 2 lanes the same arithmetic would give red → magenta, the opposite
+  direction.
+
+This points to a lane byte-sync (D-PHY start-of-transmission) loss at the
+panel's receiver, rather than a whole-line FIFO creep. That also explains why
+the host's DSI error latches stay clean: they cover the host's own receive
+path, not the panel's. Unverified. A macro photo of a solid red bar in the bad
+state would distinguish the cases: a repeating 4-pixel column structure fits a
+lane slip, while row structure fits a line FIFO.
+
+**Observation: host and bridge timings differ.** Three timings are in play.
+The live DSI host registers confirm the bridge runs the firmware's own timing
+whatever the host sends (`vsa/vbp/vfp = 1/15/20`, `hline` 931 ≈ 1241 × ¾,
+i.e. a lane clock sized exactly for non-burst 24 bpp over 4 lanes, with no
+burst headroom).
+
+| Source | H total | V total | Rate |
+| --- | --- | --- | --- |
+| Firmware OCM table / live DSI host | 1241 | 1956 | `SW_PANEL_FRAME_RATE` 80 |
+| EDID (KWin desktop) | 1220 | 1956 | 143.18 MHz, 60 Hz |
+| `DeckSight.lua` (gamescope) | 1240 | 1998 | 40–80 Hz |
+
+Game Mode ↔ Desktop is therefore a host timing change even at "60 Hz". DPMS,
+which never changes the timing, reproduced the fault 0/30. The DeckSight
+developer's position is that timing changes will not fix the issue properly,
+so this is recorded as context for the non-burst hypothesis (non-burst gives
+no slack for any host/bridge mismatch), not as a proposed fix.
+
 ### Panel identity and burst-mode support are unknown
 
 The EDID vendor ID decodes to `DSO`/`0x5001` with descriptor text literally
@@ -345,3 +388,57 @@ configuration on every eDP retrain rather than only at boot. Only an
 identified, firmware-approved reset/reinitialization sequence should be
 considered for a serialized runtime service or a firmware
 patch. Do not send guessed ANX or panel writes while video is active.
+
+A runtime alternative to the test BIOS image now exists:
+`tools/decksight-anx-burst.py` (documented in `tools/decksight-anx-burst.md`).
+It replays the EC's own panel-table tail with only `SW_PANEL_INFO_1` changed
+to the stock burst value `0x48`. That is a single-byte `ANW1` write plus the
+firmware's `MISC_NOTIFY_OCM` notification, behind a hard register/value
+allowlist. The change is held in bridge RAM only, and a full shutdown restores
+r04. Whether the OCM re-runs panel init on a runtime notification is unknown;
+the tool reports whether the DSI host registers were reprogrammed.
+
+First live run (2026-10-01, clean panel, eDP-1 enabled alongside an external
+display):
+
+- **Baseline:** `0xB1 = 0x44`, `SW_PANEL_FRAME_RATE = 80`, `0x9F/0x9E =
+  0x7B/0xC0` (`PANEL_INFO_SET_DONE` already set), `VID_MODE_CFG =
+  0x00003f01`, packet size 1080, `hsa/hbp/hline = 1/18/931`,
+  `vsa/vbp/vfp = 1/15/20`.
+- **The DSI host runs the firmware's timing.** Those timing values are the
+  firmware panel table's own, not the host DRM mode's.
+- **PHY status bit 0 is probably unwired.** The PHY status byte is `0x28`
+  (clock lane and lane 0 out of ULPS) with the lock bit at 0 while video runs
+  normally, so that bit is probably not wired on this PHY.
+- **Plain re-notify did nothing.** Writing `0xB1 = 0x48` stuck (the OCM did
+  not overwrite it), but re-sending `0x9F = 0x7B`, `0x9E = 0xC0` changed no DSI
+  host register and nothing visible on the panel.
+- **`--rearm` did nothing either.** Clearing `PANEL_INFO_SET_DONE` first
+  (`0x9E = 0x80`, then `0x7B`/`0xC0`) also changed nothing. The OCM does not
+  treat this notification as a runtime re-init trigger, whether the flag is
+  already set or goes from 0 to 1.
+
+- **eDP stream restart did nothing.** With `0x48` stored, an eDP stream
+  restart (`kscreen-doctor output.eDP-1.disable`, 3 s, `enable`) also left
+  every DSI host register unchanged.
+- **Output disable/enable does not power-cycle the bridge.** `0xB1` still read
+  `0x48` afterwards, so the EC did not rewrite its panel table. This is
+  consistent with DPMS never clearing the fault.
+
+- **A real suspend/resume restores r04.** Run with `0x48` stored
+  (`rtcwake -m mem -s 15`), it returned `0xB1` to `0x44`, with every other
+  register at its r04 baseline.
+
+The EC rewrites the OCM panel table on resume. Combined with the three failed
+runtime triggers above (notify, notify with re-arm, stream restart), this
+means the OCM applies `SW_PANEL_INFO_1` only when the EC pushes its table at
+bridge power-up, and the EC always pushes `0x44`. **Burst mode cannot be
+tested at runtime; it needs a firmware image with `0xB1 = 0x48`**, which can't
+be validly signed and so must be flashed with an SPI programmer. The runtime
+override is fully reverted by suspend/resume or a shutdown.
+
+This also refines the resume-path lead: on resume the EC does re-push the OCM
+panel table (`0x01:0x9D`-`0xB1`), but the bridge's DPCD capabilities still
+come back as ANX defaults (4 lanes × 5.4 Gbps) rather than r04's DPCD table.
+So resume reapplies the panel table but not the DPCD table: a concrete,
+partial difference from cold boot.
