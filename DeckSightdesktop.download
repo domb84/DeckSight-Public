@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DeckSight Installer
+Comment=Download and run the DeckSight installer
+Exec=bash -c 'rm -rf /tmp/decksight && mkdir -p /tmp/decksight && curl -fsSL https://www.shadetechnik.com/s/DeckSight-Install-Helper.sh -o /tmp/decksight/DeckSight-Install-Helper.sh && chmod +x /tmp/decksight/DeckSight-Install-Helper.sh && bash /tmp/decksight/DeckSight-Install-Helper.sh'
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;

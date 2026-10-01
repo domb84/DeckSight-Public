@@ -1,0 +1,12 @@
+[Unit]
+Description=DeckSight Brightness Control
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/var/local/bin/decksight-brightnessctrl
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
